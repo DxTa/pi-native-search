@@ -7,6 +7,8 @@ A [pi](https://github.com/badlogic/pi-mono) extension that adds `web_search` and
 
 The headline feature: when you're using your **Claude Code subscription via [pi-claude-bridge](https://www.npmjs.com/package/pi-claude-bridge)**, search and fetch are delegated to Claude Code's actual `WebSearch` and `WebFetch` tools — the same ones you get in Zed, Claude Desktop, or the Claude Code CLI. No separate API key required.
 
+Now also supports **Ollama** — if you run models locally via [Ollama](https://ollama.com), search and fetch are routed to Ollama's built-in experimental web search and fetch endpoints. No API key needed — just have Ollama running locally.
+
 ## Why
 
 Pi ships with provider plumbing but no built-in search. Most extensions either (a) hard-code DuckDuckGo, or (b) require you to wire up your own paid search API. This extension uses what each provider already gives you for free.
@@ -15,13 +17,15 @@ Pi ships with provider plumbing but no built-in search. Most extensions either (
 |---|---|---|
 | **claude-bridge** (Claude Code subscription) | Claude Code's `WebSearch` / `WebFetch` (via `@anthropic-ai/claude-agent-sdk`) | Your `claude` CLI login |
 | **zai** (GLM) | ZAI MCP `web_search_prime` (included in Coding Plans, *not* the separate paid Web Search API) | `ZAI_API_KEY` |
+| **ollama** | Local experimental `/api/experimental/web_search` + `/api/experimental/web_fetch` | Local instance (`OLLAMA_HOST`, may require `ollama signin`) |
+| **ollama-cloud** | Cloud `/api/web_search` + `/api/web_fetch` | `OLLAMA_API_KEY` (or auth.json) |
 | **anthropic** | `web_search_20250305` server tool | `ANTHROPIC_API_KEY` |
 | **google** (Gemini) | `google_search` grounding tool | `GEMINI_API_KEY` |
 | **openai** | Responses API `web_search` tool | `OPENAI_API_KEY` |
 | **xai** (Grok) | Responses API `web_search` tool | `XAI_API_KEY` |
 | All other providers | DuckDuckGo HTML fallback | none |
 
-`web_fetch` uses the same routing — currently only `claude-bridge` has a native backend; everything else uses a built-in HTTP fetcher.
+`web_fetch` uses the same routing — `claude-bridge`, `ollama` (local), and `ollama-cloud` have native fetch backends; everything else uses a built-in HTTP fetcher.
 
 ## Install
 
@@ -53,6 +57,8 @@ The bottom status bar shows the active backend per call, e.g.:
 ```
 search[search:native:cc-sdk,fetch:cc-sdk]    # claude-bridge route
 search[search:native:mcp,fetch]               # ZAI route
+search[search:native:ollama,fetch:ollama]      # Ollama (local) route
+search[search:native:ollama-cloud,fetch:ollama-cloud]  # Ollama Cloud route
 search[search:ddg,fetch]                      # DDG fallback
 ```
 
@@ -72,6 +78,8 @@ async function doSearch(query, provider, model, baseUrl, signal) {
       case "openai":        return openaiSearch(query, model, apiKey, signal);
       case "xai":           return xaiSearch(query, model, apiKey, signal);
       case "anthropic":     return anthropicSearch(query, model, apiKey, baseUrl, signal);
+      case "ollama":        return ollamaSearch(query, signal);
+      case "ollama-cloud":  return ollamaCloudSearch(query, apiKey, signal);
       case "claude-bridge": return claudeBridgeSearch(query, signal);
     }
   }
@@ -145,6 +153,24 @@ case "foo":
 That's it. The settings UI, status line, and fallback handling all pick it up automatically from the `PROVIDERS` map.
 
 If the provider doesn't use a standard `Bearer` API key (e.g. OAuth, MCP session, or an SDK that handles auth itself like `claude-bridge`), see `claudeBridgeSearch` for how to special-case the auth check in `hasCredentials` and the `hasAuth` gate in `doSearch`.
+
+### Ollama specifics
+
+When the active provider is `ollama`, the extension connects to Ollama's experimental web search and fetch REST endpoints at `http://localhost:11434/api/experimental/web_search` and `/api/experimental/web_fetch`. This means:
+
+- No extra dependency to install — uses the local Ollama server.
+- Respects the `OLLAMA_HOST` environment variable for custom hosts.
+- If you get a 401 error, run `ollama signin` to authenticate.
+- If Ollama is not running or web search is not enabled, the search falls back to DuckDuckGo with a clear error message.
+- Both `web_search` and `web_fetch` are supported natively — no HTTP-based fallback needed for fetch either.
+
+### Ollama Cloud specifics
+
+When the active provider is `ollama-cloud`, the extension connects to Ollama Cloud's web search and fetch REST endpoints at `https://ollama.com/api/web_search` and `/api/web_fetch`. This means:
+
+- Requires an `OLLAMA_API_KEY` environment variable or an `ollama-cloud` entry in `auth.json`.
+- Respects the `OLLAMA_API_BASE` environment variable for custom base URLs.
+- If using `pi-ollama-cloud` as the model provider, both `ollama_web_search`/`ollama_web_fetch` (from that extension) and `web_search`/`web_fetch` (from this extension) will be available. This extension's tools offer DuckDuckGo as a fallback if the cloud API fails.
 
 ## Development
 

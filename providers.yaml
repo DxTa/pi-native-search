@@ -121,3 +121,23 @@ providers:
     name: "OpenCode"
     native_search: false
     native_fetch: false
+    search_type: ""
+
+  ollama:
+    name: "Ollama (local)"
+    native_search: true
+    native_fetch: true
+    # Uses Ollama's experimental /api/experimental/web_search and web_fetch endpoints
+    # Requires local Ollama instance running with web search enabled
+    # Respects OLLAMA_HOST env var (default: http://localhost:11434)
+    # May require `ollama signin` for authentication
+    search_type: "ollama_experimental"
+
+  ollama-cloud:
+    name: "Ollama Cloud"
+    native_search: true
+    native_fetch: true
+    # Uses Ollama Cloud's /api/web_search and /api/web_fetch endpoints
+    # Requires OLLAMA_API_KEY env var or auth.json entry
+    # Respects OLLAMA_API_BASE env var (default: https://ollama.com)
+    search_type: "ollama_cloud"

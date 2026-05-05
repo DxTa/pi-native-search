@@ -3,7 +3,7 @@
  *
  * Adds web_search and web_fetch tools to pi.
  * Uses the current provider's native web search API when available
- * (ZAI, Google, OpenAI, xAI, Anthropic), falls back to DuckDuckGo otherwise.
+ * (ZAI, Google, OpenAI, xAI, Anthropic, Ollama, Ollama Cloud), falls back to DuckDuckGo otherwise.
  * ZAI search uses the Web Search Prime MCP endpoint (included in
  * Coding Plans) rather than the separate paid Web Search API.
  *
@@ -183,6 +183,18 @@ const PROVIDERS: Record<
     nativeFetch: false,
     envKey: "OPENCODE_API_KEY",
   },
+  ollama: {
+    name: "Ollama (local)",
+    nativeSearch: true,
+    nativeFetch: true,
+    envKey: "",
+  },
+  "ollama-cloud": {
+    name: "Ollama Cloud",
+    nativeSearch: true,
+    nativeFetch: true,
+    envKey: "OLLAMA_API_KEY",
+  },
 };
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -233,6 +245,8 @@ function hasCredentials(provider: string): boolean {
   // claude-bridge uses the `claude` CLI's own subscription auth — assume it's
   // available if the user has selected this provider in pi.
   if (provider === "claude-bridge") return true;
+  // ollama uses a local server — assume it's available if the user has selected it.
+  if (provider === "ollama") return true;
   if (getApiKey(provider)) return true;
   try {
     const authPath = join(getAgentDir(), "auth.json");
@@ -678,6 +692,241 @@ async function claudeBridgeFetch(
   }
 }
 
+// ─── Ollama Web Search & Fetch ──────────────────────────────────────────────
+//
+// Uses Ollama's experimental /api/experimental/web_search and web_fetch endpoints.
+// Requires a local Ollama instance with web search enabled (ollama serve).
+// May require `ollama signin` if auth is needed (401 response).
+// Respects the OLLAMA_HOST environment variable for custom host.
+
+function getOllamaHost(): string {
+  const envHost = process.env.OLLAMA_HOST;
+  if (envHost) {
+    // OLLAMA_HOST may be just a host:port or a full URL
+    if (envHost.startsWith("http://") || envHost.startsWith("https://")) {
+      return envHost.replace(/\/+$/, "");
+    }
+    return `http://${envHost}`;
+  }
+  return "http://localhost:11434";
+}
+
+interface OllamaSearchResponse {
+  results: Array<{
+    title: string;
+    url: string;
+    content: string;
+  }>;
+}
+
+interface OllamaFetchResponse {
+  title: string;
+  content: string;
+  links: string[];
+}
+
+class OllamaAuthError extends Error {
+  constructor() {
+    super("Unauthorized. Run `ollama signin` to authenticate.");
+    this.name = "OllamaAuthError";
+  }
+}
+
+class OllamaConnectionError extends Error {
+  constructor(host: string) {
+    super(
+      `Could not connect to Ollama at ${host}. Make sure Ollama is running and web search is enabled.`,
+    );
+    this.name = "OllamaConnectionError";
+  }
+}
+
+async function ollamaSearch(
+  query: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const host = getOllamaHost();
+  let res: Response;
+  try {
+    res = await fetch(`${host}/api/experimental/web_search`, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, max_results: 8 }),
+    });
+  } catch (err: any) {
+    if (err?.cause?.code === "ECONNREFUSED" || err?.message?.includes("ECONNREFUSED"))
+      throw new OllamaConnectionError(host);
+    throw err;
+  }
+  if (res.status === 401) throw new OllamaAuthError();
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(
+      `Ollama search ${res.status}: ${(errText || res.statusText).slice(0, 200)}`,
+    );
+  }
+  const data = (await res.json()) as OllamaSearchResponse;
+  if (!data.results?.length) return "No results found.";
+  const parts: string[] = [];
+  for (let i = 0; i < Math.min(data.results.length, 8); i++) {
+    const r = data.results[i]!;
+    parts.push(`${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.content}`);
+  }
+  return parts.join("\n\n");
+}
+
+async function ollamaFetch(
+  url: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const host = getOllamaHost();
+  let res: Response;
+  try {
+    res = await fetch(`${host}/api/experimental/web_fetch`, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+  } catch (err: any) {
+    if (err?.cause?.code === "ECONNREFUSED" || err?.message?.includes("ECONNREFUSED"))
+      throw new OllamaConnectionError(host);
+    throw err;
+  }
+  if (res.status === 401) throw new OllamaAuthError();
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(
+      `Ollama fetch ${res.status}: ${(errText || res.statusText).slice(0, 200)}`,
+    );
+  }
+  const data = (await res.json()) as OllamaFetchResponse;
+  const parts: string[] = [];
+  if (data.title) parts.push(`Title: ${data.title}`);
+  if (data.content) {
+    parts.push("");
+    parts.push(data.content);
+  }
+  if (data.links?.length) {
+    parts.push("");
+    parts.push(`Links found: ${data.links.length}`);
+    for (const l of data.links.slice(0, 10)) parts.push(`  - ${l}`);
+  }
+  const text = parts.join("\n");
+  const t = truncateHead(text, {
+    maxLines: DEFAULT_MAX_LINES,
+    maxBytes: DEFAULT_MAX_BYTES,
+  });
+  return (
+    t.content +
+    (t.truncated ? `\n\n[Truncated: ${t.outputLines}/${t.totalLines} lines]` : "")
+  );
+}
+
+// ─── Ollama Cloud Web Search & Fetch ─────────────────────────────────────────
+//
+// Uses Ollama Cloud's /api/web_search and /api/web_fetch endpoints.
+// Requires an Ollama Cloud API key (OLLAMA_API_KEY env var or auth.json).
+// Respects the OLLAMA_API_BASE env var for custom base URL.
+
+function getOllamaCloudBase(): string {
+  return (
+    process.env.OLLAMA_API_BASE || "https://ollama.com"
+  ).replace(/\/+$/, "");
+}
+
+interface OllamaCloudSearchResponse {
+  results: Array<{
+    title: string;
+    url: string;
+    content: string;
+  }>;
+}
+
+interface OllamaCloudFetchResponse {
+  title: string;
+  content: string;
+  links: string[];
+}
+
+async function ollamaCloudSearch(
+  query: string,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const base = getOllamaCloudBase();
+  const res = await fetch(`${base}/api/web_search`, {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ query, max_results: 8 }),
+  });
+  if (res.status === 401) throw new Error("Unauthorized. Check your OLLAMA_API_KEY.");
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(
+      `Ollama Cloud search ${res.status}: ${(errText || res.statusText).slice(0, 200)}`,
+    );
+  }
+  const data = (await res.json()) as OllamaCloudSearchResponse;
+  if (!data.results?.length) return "No results found.";
+  const parts: string[] = [];
+  for (let i = 0; i < Math.min(data.results.length, 8); i++) {
+    const r = data.results[i]!;
+    parts.push(`${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.content}`);
+  }
+  return parts.join("\n\n");
+}
+
+async function ollamaCloudFetch(
+  url: string,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const base = getOllamaCloudBase();
+  const res = await fetch(`${base}/api/web_fetch`, {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ url }),
+  });
+  if (res.status === 401) throw new Error("Unauthorized. Check your OLLAMA_API_KEY.");
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(
+      `Ollama Cloud fetch ${res.status}: ${(errText || res.statusText).slice(0, 200)}`,
+    );
+  }
+  const data = (await res.json()) as OllamaCloudFetchResponse;
+  const parts: string[] = [];
+  if (data.title) parts.push(`Title: ${data.title}`);
+  if (data.content) {
+    parts.push("");
+    parts.push(data.content);
+  }
+  if (data.links?.length) {
+    parts.push("");
+    parts.push(`Links found: ${data.links.length}`);
+    for (const l of data.links.slice(0, 10)) parts.push(`  - ${l}`);
+  }
+  const text = parts.join("\n");
+  const t = truncateHead(text, {
+    maxLines: DEFAULT_MAX_LINES,
+    maxBytes: DEFAULT_MAX_BYTES,
+  });
+  return (
+    t.content +
+    (t.truncated ? `\n\n[Truncated: ${t.outputLines}/${t.totalLines} lines]` : "")
+  );
+}
+
 // ─── DuckDuckGo Fallback ─────────────────────────────────────────────────────
 
 function extractDdgUrl(raw: string): string {
@@ -767,7 +1016,7 @@ async function doSearch(
   const cap = PROVIDERS[provider];
   // claude-bridge uses the `claude` CLI's own subscription auth, so it doesn't
   // need an api_key in pi's auth.json.
-  const hasAuth = !!apiKey || provider === "claude-bridge";
+  const hasAuth = !!apiKey || provider === "claude-bridge" || provider === "ollama";
   if (cap?.nativeSearch && hasAuth) {
     try {
       switch (provider) {
@@ -783,6 +1032,10 @@ async function doSearch(
           return {
             text: await anthropicSearch(query, model, apiKey!, baseUrl, signal),
           };
+        case "ollama":
+          return { text: await ollamaSearch(query, signal) };
+        case "ollama-cloud":
+          return { text: await ollamaCloudSearch(query, apiKey!, signal) };
         case "claude-bridge":
           return { text: await claudeBridgeSearch(query, signal) };
       }
@@ -824,7 +1077,7 @@ export default function searchExtension(pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web. Uses native provider search (ZAI MCP, Anthropic, Google, OpenAI, xAI) or DuckDuckGo fallback.",
+      "Search the web. Uses native provider search (ZAI MCP, Anthropic, Google, OpenAI, xAI, Ollama, Ollama Cloud) or DuckDuckGo fallback.",
     parameters: Type.Object({ query: Type.String({ description: "Search query" }) }),
     async execute(_id, params, signal, onUpdate, ctx) {
       if (!isSearchAvailable(ctx, config))
@@ -843,7 +1096,7 @@ export default function searchExtension(pi: ExtensionAPI) {
       const cap = PROVIDERS[provider];
       const hasNative =
         !!cap?.nativeSearch &&
-        (!!getApiKey(provider) || provider === "claude-bridge");
+        (!!getApiKey(provider) || provider === "claude-bridge" || provider === "ollama");
       onUpdate?.({
         content: [
           {
@@ -911,7 +1164,7 @@ export default function searchExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text" as const, text: "Web fetch disabled." }] };
       const provider = getCurrentProvider(ctx) ?? "";
       const cap = PROVIDERS[provider];
-      const useNative = !!cap?.nativeFetch && provider === "claude-bridge";
+      const useNative = !!cap?.nativeFetch && (provider === "claude-bridge" || provider === "ollama" || provider === "ollama-cloud");
       onUpdate?.({
         content: [
           {
@@ -925,10 +1178,22 @@ export default function searchExtension(pi: ExtensionAPI) {
         let nativeError: string | undefined;
         if (useNative) {
           try {
-            text = await claudeBridgeFetch(params.url, signal);
+            if (provider === "ollama") {
+              text = await ollamaFetch(params.url, signal);
+            } else if (provider === "ollama-cloud") {
+              const fetchApiKey = getApiKey(provider);
+              text = await ollamaCloudFetch(params.url, fetchApiKey!, signal);
+            } else {
+              text = await claudeBridgeFetch(params.url, signal);
+            }
           } catch (err: any) {
             nativeError = err.message;
-            text = await httpFetch(params.url, signal);
+            try {
+              text = await httpFetch(params.url, signal);
+            } catch (_fetchErr: any) {
+              // If native AND HTTP both fail, throw the original native error
+              throw new Error(nativeError);
+            }
           }
         } else {
           text = await httpFetch(params.url, signal);
@@ -1114,7 +1379,7 @@ export default function searchExtension(pi: ExtensionAPI) {
       .map(([id, cap]) => ({
         value: id,
         label: `${cap.name}${id === currentProvider ? " ← current" : ""}${hasCredentials(id) ? " ✓" : ""}`,
-        description: `search: ${cap.nativeSearch ? `native (${id === "zai" ? "MCP" : id === "anthropic" ? "web_search server tool" : `model: ${id === currentProvider ? currentModel : "?"}`})` : "duckduckgo"} | key: ${hasCredentials(id) ? "yes" : "no"}`,
+        description: `search: ${cap.nativeSearch ? `native (${id === "zai" ? "MCP" : id === "anthropic" ? "web_search server tool" : id === "ollama" ? "experimental API" : id === "ollama-cloud" ? "cloud API" : `model: ${id === currentProvider ? currentModel : "?"}`})` : "duckduckgo"} | key: ${hasCredentials(id) ? "yes" : "no"}`,
       }));
 
     await ctx.ui.custom((tui, theme, _kb, done) => {
@@ -1188,11 +1453,17 @@ export default function searchExtension(pi: ExtensionAPI) {
     const cap = p ? PROVIDERS[p] : undefined;
     const m =
       cap?.nativeSearch && hasCredentials(p ?? "")
-        ? `native:${p === "zai" ? "mcp" : p === "claude-bridge" ? "cc-sdk" : model || "?"}`
+        ? `native:${p === "zai" ? "mcp" : p === "claude-bridge" ? "cc-sdk" : p === "ollama" ? "ollama" : p === "ollama-cloud" ? "ollama-cloud" : model || "?"}`
         : "ddg";
     const fetchBackend =
-      cap?.nativeFetch && hasCredentials(p ?? "") && p === "claude-bridge"
-        ? "fetch:cc-sdk"
+      cap?.nativeFetch && hasCredentials(p ?? "")
+        ? p === "claude-bridge"
+          ? "fetch:cc-sdk"
+          : p === "ollama"
+            ? "fetch:ollama"
+            : p === "ollama-cloud"
+              ? "fetch:ollama-cloud"
+              : "fetch"
         : "fetch";
     const parts: string[] = [];
     if (config.searchEnabled) parts.push(`search:${m}`);

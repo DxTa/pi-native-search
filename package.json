@@ -2,7 +2,7 @@
   "name": "pi-native-search",
   "version": "0.1.0",
   "private": false,
-  "description": "Pi extension that adds web_search and web_fetch tools using each provider's native search backend (ZAI MCP, Anthropic, Google, OpenAI, xAI, Claude Code subscription via claude-bridge), with DuckDuckGo as a universal fallback.",
+  "description": "Pi extension that adds web_search and web_fetch tools using each provider's native search backend (ZAI MCP, Anthropic, Google, OpenAI, xAI, Ollama, Ollama Cloud, Claude Code subscription via claude-bridge), with DuckDuckGo as a universal fallback.",
   "keywords": [
     "pi-package",
     "pi",
@@ -12,6 +12,7 @@
     "claude",
     "claude-code",
     "glm",
+    "ollama",
     "duckduckgo"
   ],
   "author": "Salem Malibary <salem.thecreativeconsult@gmail.com>",
